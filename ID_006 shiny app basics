@@ -1,0 +1,466 @@
+# app.R
+
+# --- 1. LOAD PACKAGES ---
+library(shiny)
+library(bslib)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(data.table) # For fread()
+
+# --- 2. GLOBAL DATA / FUNCTIONS ---
+
+# Function to load and clean GWAS data (returns list with data, trait, sample_snp_id, axis_set, study_info)
+load_and_clean_gwas_data <- function(filepath, col_map = NULL, delimiter = NULL, trait_name_for_func, study_info_list_for_func) {
+  # Add tryCatch block for robust error handling within data loading
+  # (Removed outer tryCatch for global load, this one remains for internal function errors)
+  tryCatch({
+    full_filepath <- file.path(getwd(), filepath)
+    gwas_data_raw <- as_tibble(fread(full_filepath, header = TRUE, sep = delimiter, stringsAsFactors = FALSE, check.names = FALSE))
+    
+    print(paste("Columns in raw data from", filepath, ":"))
+    print(names(gwas_data_raw))
+    
+    # --- Renaming columns based on col_map ---
+    if (!is.null(col_map) && length(col_map) > 0) { 
+      cols_to_rename <- intersect(names(gwas_data_raw), names(col_map))
+      for (old_name in cols_to_rename) {
+        new_name <- col_map[[old_name]]
+        if (old_name %in% names(gwas_data_raw)) {
+          gwas_data_raw <- gwas_data_raw %>%
+            rename_with(~ new_name, .cols = all_of(old_name))
+        } else {
+          warning(paste("Column '", old_name, "' not found in file '", filepath, "' for renaming.", sep=""))
+        }
+      }
+    }
+    
+    # --- Check for essential columns after renaming ---
+    required_cols <- c("SNP", "CHR", "BP", "P", "A1", "A2", "EFFECT_A1", "SE") 
+    missing_cols <- setdiff(required_cols, names(gwas_data_raw))
+    if (length(missing_cols) > 0) {
+      stop(paste0("Missing required columns in '", filepath, "': ",
+                  paste(missing_cols, collapse = ", "),
+                  ". Please check file header and column mapping."))
+    }
+    
+    # Check if FREQ_A1 exists, if not, create it as NA
+    if (!"FREQ_A1" %in% names(gwas_data_raw)) {
+      gwas_data_raw$FREQ_A1 <- NA_real_ 
+    }
+    
+    # Ensure types and perform standard cleaning
+    gwas_data_cleaned <- gwas_data_raw %>%
+      mutate(Original_CHR = as.character(CHR)) %>%
+      mutate(Cleaned_CHR_temp = toupper(gsub("^chr", "", CHR))) %>%
+      mutate(CHR = case_when(
+        Cleaned_CHR_temp == "X" ~ 23,
+        Cleaned_CHR_temp == "Y" ~ 24,
+        Cleaned_CHR_temp == "MT" ~ 25,
+        grepl("^[0-9]+$", Cleaned_CHR_temp) ~ as.numeric(Cleaned_CHR_temp), 
+        TRUE ~ NA_real_ 
+      )) %>%
+      select(-Cleaned_CHR_temp) %>%
+      filter(!is.na(CHR)) %>% # Filter out rows where CHR couldn't be converted
+      mutate(BP = as.numeric(BP)) %>%
+      filter(!is.na(BP)) %>%
+      mutate(P = as.numeric(P)) %>%
+      filter(!is.na(P)) %>%
+      mutate(LOG10P = -log10(P + .Machine$double.eps)) %>%
+      mutate(EFFECT_A1 = as.numeric(EFFECT_A1)) %>%
+      mutate(SE = as.numeric(SE)) %>%
+      arrange(CHR, BP)
+    
+    # Check if data is empty after cleaning
+    if (nrow(gwas_data_cleaned) == 0) {
+      message("load_and_clean_gwas_data: No data remaining after cleaning for ", filepath)
+      return(NULL) 
+    }
+    
+    # Calculate cumulative positions and axis_set within this function
+    gwas_data_processed_with_cumpos <- gwas_data_cleaned %>%
+      group_by(CHR) %>%
+      summarise(max_bp = max(BP)) %>%
+      mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0)) %>%
+      ungroup() %>%
+      select(CHR, bp_add) %>%
+      right_join(gwas_data_cleaned, by = "CHR") %>%
+      mutate(BP_cum = as.numeric(BP) + bp_add)
+    
+    # Check if data is empty after cumulative position calculation
+    if (nrow(gwas_data_processed_with_cumpos) == 0) {
+      message("load_and_clean_gwas_data: No data remaining after cumulative position calculation for ", filepath)
+      return(NULL) 
+    }
+    
+    current_axis_set <- gwas_data_processed_with_cumpos %>%
+      group_by(CHR) %>%
+      summarise(center = mean(BP_cum), Original_CHR = first(Original_CHR)) %>%
+      ungroup()
+    
+    # Check if axis_set is valid
+    if (nrow(current_axis_set) == 0 || !is.finite(current_axis_set$center[1])) { # Check first center to avoid NA/Inf
+      message("load_and_clean_gwas_data: Invalid axis_set created for ", filepath)
+      return(NULL) 
+    }
+    
+    return(list(
+      data = gwas_data_processed_with_cumpos,
+      trait = trait_name_for_func, 
+      sample_snp_id = gwas_data_cleaned %>% arrange(P) %>% head(1) %>% pull(SNP),
+      axis_set = current_axis_set,
+      study_info = study_info_list_for_func 
+    ))
+  }, error = function(e) {
+    message("ERROR IN DATA CLEANING/PROCESSING (load_and_clean_gwas_data function): ", e$message)
+    return(NULL) # Return NULL if an error occurs within this function
+  })
+}
+
+# --- Global Data for ID_006.tsv (Loaded once at startup) ---
+id006_metadata_for_global_load <- list(
+  filepath = "ID_006.tsv", # File is expected in the app's working directory
+  trait = "Educational Attainment (ID_006)",
+  study_info = list( # Dummy study info for summary card
+    reported_trait = "Educational Attainment (college completion)",
+    trait_s = "self reported educational attainment",
+    first_author = "Demo Study",
+    journal = "Demo Journal",
+    pub_date = "202X-XX-XX",
+    pubmed_id = "DemoID",
+    discovery_sample = "Demo Sample Description",
+    replication_sample = "N/A",
+    genotyping_tech = "Demo Genotyping Technology",
+    platform = "Demo Platform"
+  ),
+  col_map = list(
+    Chromosome = "CHR", Position = "BP", unique_key = "SNP",
+    Allele1 = "A1", Allele2 = "A2", Effect = "EFFECT_A1",
+    StdErr = "SE", `P-value` = "P", Freq1 = "FREQ_A1"
+  ),
+  delimiter = "\t" # Tab-separated
+)
+
+# Perform Initial Global Load of ID_006.tsv (no tryCatch here, let app crash for clarity)
+print("Attempting initial global data load for ID_006.tsv...")
+initial_gwas_data_info_global <- load_and_clean_gwas_data(
+  filepath = id006_metadata_for_global_load$filepath, 
+  col_map = id006_metadata_for_global_load$col_map,
+  delimiter = id006_metadata_for_global_load$delimiter,
+  trait_name_for_func = id006_metadata_for_global_load$trait,
+  study_info_list_for_func = id006_metadata_for_global_load$study_info
+)
+print("Initial global data load completed.") # This will print even if loaded data is NULL
+if (is.null(initial_gwas_data_info_global)) {
+  message("Initial global data load failed. App will likely stop or plots will be blank.")
+  stop("Failed to load initial data. Check console for 'ERROR IN DATA CLEANING/PROCESSING'.")
+}
+
+# Get max LOG10P from the globally loaded data for slider max (with fallback)
+max_log10p_global_for_slider <- if (!is.null(initial_gwas_data_info_global) && !is.null(initial_gwas_data_info_global$data) && !is.null(initial_gwas_data_info_global$data$LOG10P)) {
+  max(initial_gwas_data_info_global$data$LOG10P, na.rm = TRUE)
+} else {
+  10 # Fallback max
+}
+
+
+# --- 3. USER INTERFACE (UI) DEFINITION ---
+ui <- page_sidebar(
+  theme = bs_theme(
+    version = 5,
+    bootswatch = "flatly",
+    primary = "#007bff",
+    font_scale = 1.0
+  ),
+  title = "GWAS Viewer - Educational Attainment (ID_006)", # Specific title for ID_006
+  sidebar = sidebar(
+    h4("Currently Displaying"),
+    p(textOutput("current_study_name")), # Display current study name
+    hr(),
+    h4("Filters"), # Consolidated filter section title
+    sliderInput(
+      inputId = "p_threshold",
+      label = "Significance Threshold (-log10 P):",
+      min = 0,
+      max = max_log10p_global_for_slider + 1,
+      value = 5, # Default to a value that might show some significant hits
+      step = 0.1
+    )
+    # All other filter controls are removed in this barebones version.
+  ),
+  navset_card_tab(
+    nav_panel("Manhattan Plot",
+              card(
+                card_header(uiOutput("manhattan_plot_header")), 
+                plotlyOutput("manhattan_plot", height = "500px")
+              )
+    ),
+    nav_panel("QQ Plot",
+              card(
+                card_header(uiOutput("qq_plot_header")), 
+                plotlyOutput("qq_plot", height = "500px")
+              )
+    ),
+    nav_panel("Summary Data",
+              card(
+                card_header(uiOutput("summary_data_header")), 
+                fluidRow(
+                  column(6, tags$b("Total SNPs (in current view):"), textOutput("total_snps")),
+                  column(6, tags$b(textOutput("significant_snps_label")), textOutput("significant_snps_count"))
+                ),
+                hr(),
+                h5(uiOutput("top_snps_table_header")),
+                tableOutput("top_snps_table")
+              ),
+              card(
+                card_header(uiOutput("study_info_header")),
+                uiOutput("study_info_content")
+              )
+    )
+  )
+)
+
+# --- 4. SERVER LOGIC DEFINITION ---
+server <- function(input, output, session) {
+  
+  # Helper to create a paragraph with bold label, handles NA values
+  info_paragraph <- function(label, value) {
+    # Ensure value is character and non-empty before returning p tag
+    if (is.null(value) || is.na(value) || as.character(value) == "" || length(value) == 0) { # Added length(value) == 0 check
+      return(NULL) # Return NULL if value is problematic
+    }
+    p(tags$b(paste0(label, ": ")), as.character(value)) # Ensure value is character
+  }
+  
+  # Reactive that provides the currently available data (globally loaded in this version)
+  r_gwas_info <- reactive({
+    req(!is.null(initial_gwas_data_info_global)) # Ensure global data is loaded
+    print("r_gwas_info is providing data.")
+    initial_gwas_data_info_global
+  })
+  
+  # Reactive to get the current data (from r_gwas_info)
+  current_gwas_data_reactive <- reactive({
+    print("Executing current_gwas_data_reactive...")
+    req(r_gwas_info()) 
+    data <- r_gwas_info()$data
+    print(paste("current_gwas_data_reactive has", nrow(data), "rows."))
+    data
+  })
+  
+  # Reactive to get the current axis_set (from r_gwas_info)
+  current_axis_set_reactive <- reactive({
+    print("Executing current_axis_set_reactive...")
+    req(r_gwas_info())
+    axis_set <- r_gwas_info()$axis_set
+    print("current_axis_set_reactive created.")
+    print(axis_set)
+    axis_set
+  })
+  
+  # Reactive expression to filter data based on p_threshold slider
+  filtered_data_for_plots_reactive <- reactive({
+    print("Executing filtered_data_for_plots_reactive...")
+    plot_data <- current_gwas_data_reactive()
+    threshold <- input$p_threshold # This depends on input$p_threshold
+    
+    print(paste("Filtering for plots based on threshold:", threshold))
+    print(paste("Rows before filtering for plots:", nrow(plot_data)))
+    
+    # Ensure LOG10P exists before trying to use it in mutate
+    if (!"LOG10P" %in% names(plot_data)) {
+      message("LOG10P column not found in plot_data for filtering. Skipping significance calculation.")
+      plot_data_filtered <- plot_data %>%
+        mutate(is_significant = FALSE) %>% # Default to not significant
+        mutate(alpha_value = 0.7) %>% # Default alpha
+        mutate(color_group = as.character(CHR %% 2))
+    } else {
+      plot_data_filtered <- plot_data %>%
+        mutate(is_significant = LOG10P >= threshold) %>%
+        mutate(alpha_value = ifelse(is_significant, 1, 0.7)) %>%
+        mutate(color_group = as.character(CHR %% 2))
+    }
+    
+    print(paste("Rows after filtering for plots:", nrow(plot_data_filtered)))
+    plot_data_filtered
+  })
+  
+  # --- Dynamic UI Outputs for Headers ---
+  output$current_study_name <- renderText({
+    req(r_gwas_info())
+    r_gwas_info()$trait
+  })
+  
+  output$manhattan_plot_header <- renderUI({
+    req(r_gwas_info())
+    card_header(paste("Manhattan Plot -", r_gwas_info()$trait))
+  })
+  output$qq_plot_header <- renderUI({
+    req(r_gwas_info())
+    card_header(paste("QQ Plot -", r_gwas_info()$trait))
+  })
+  output$summary_data_header <- renderUI({
+    req(r_gwas_info())
+    card_header(paste("Summary Data -", r_gwas_info()$trait))
+  })
+  output$study_info_header <- renderUI({
+    req(r_gwas_info())
+    card_header(paste0("Study Information: ", r_gwas_info()$trait))
+  })
+  
+  # --- Render Manhattan Plot ---
+  output$manhattan_plot <- renderPlotly({
+    print("Executing output$manhattan_plot...")
+    plot_data <- filtered_data_for_plots_reactive()
+    axis_set <- current_axis_set_reactive()
+    
+    req(nrow(plot_data) > 0, nrow(axis_set) > 0, !is.null(axis_set$Original_CHR), !is.null(axis_set$center))
+    
+    print(paste("Manhattan Plotting Data Range (BP_cum):", range(plot_data$BP_cum, na.rm = TRUE)[1], "-", range(plot_data$BP_cum, na.rm = TRUE)[2]))
+    print(paste("Manhattan Plotting Data Range (LOG10P):", range(plot_data$LOG10P, na.rm = TRUE)[1], "-", range(plot_data$LOG10P, na.rm = TRUE)[2]))
+    print("Axis set details (CHR, Center):")
+    print(axis_set)
+    
+    p <- ggplot(plot_data, aes(x = BP_cum, y = LOG10P,
+                               text = paste0("SNP: ", SNP,
+                                             "<br>Chr: ", Original_CHR,
+                                             "<br>Pos: ", BP,
+                                             "<br>P-value: ", formatC(P, format = "e", digits = 2),
+                                             "<br>-log10(P): ", round(LOG10P, 2),
+                                             "<br>Allele 1: ", A1,
+                                             "<br>Allele 2: ", A2,
+                                             "<br>Frequency: ", round(FREQ_A1, 3),
+                                             "<br>Effect: ", round(EFFECT_A1, 3),
+                                             "<br>StdErr: ", round(SE, 3)
+                               ))) +
+      geom_point(aes(color = as.factor(color_group), alpha = alpha_value), size = 1.5) +
+      geom_hline(yintercept = input$p_threshold, color = "red", linetype = "dashed", linewidth = 0.8) +
+      annotate("text", x = max(plot_data$BP_cum, na.rm = TRUE) * 0.95,
+               y = input$p_threshold + 0.3,
+               label = paste0("-log10(P) > ", round(input$p_threshold, 1)),
+               color = "red", size = 3, hjust = 1) +
+      scale_color_manual(values = c("0" = "#4299E1", "1" = "#F6AD55")) +
+      scale_x_continuous(labels = axis_set$Original_CHR, breaks = axis_set$center) + # Use Original_CHR for x-axis labels
+      labs(x = "Chromosome", y = expression(paste("-log"[10], "(P-value)")),
+           title = "") +
+      theme_minimal() +
+      theme(
+        legend.position = "none",
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)
+      )
+    
+    ggplotly(p, tooltip = "text") %>%
+      layout(hovermode = "closest")
+  })
+  
+  # Render QQ Plot
+  output$qq_plot <- renderPlotly({
+    print("Executing output$qq_plot...")
+    plot_data_qq <- filtered_data_for_plots_reactive()
+    
+    if (nrow(plot_data_qq) == 0 || all(is.na(plot_data_qq$P)) || all(plot_data_qq$P == 0, na.rm = TRUE)) {
+      return(ggplotly(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "P-value data missing or invalid.") + theme_void()))
+    }
+    
+    print(paste("Rendering QQ plot. Rows:", nrow(plot_data_qq)))
+    print(summary(plot_data_qq$P))
+    
+    observed_p_values <- sort(plot_data_qq$P)
+    expected_p_values <- ppoints(length(observed_p_values))
+    observed_log10p <- -log10(observed_p_values + .Machine$double.eps)
+    expected_log10p <- -log10(expected_p_values + .Machine$double.eps)
+    
+    p_qq <- ggplot(data.frame(expected_log10p, observed_log10p), aes(x = expected_log10p, y = observed_log10p)) +
+      geom_point(color = "#4299E1", alpha = 0.7) +
+      geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 0.8) +
+      labs(x = expression(paste("Expected -log"[10], "(P)")),
+           y = expression(paste("Observed -log"[10], "(P)")),
+           title = "") +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5))
+    
+    ggplotly(p_qq)
+  })
+  
+  # Render Summary Data
+  output$total_snps <- renderText({
+    print("Executing output$total_snps...")
+    req(filtered_data_for_plots_reactive())
+    paste0(prettyNum(nrow(filtered_data_for_plots_reactive()), big.mark = ","))
+  })
+  
+  output$significant_snps_label <- renderText({
+    print("Executing output$significant_snps_label...")
+    paste0("Significant SNPs (P < ", formatC(10^(-input$p_threshold), format = "e", digits = 1), "):")
+  })
+  
+  output$significant_snps_count <- renderText({
+    print("Executing output$significant_snps_count...")
+    sig_threshold_p_value <- 10^(-input$p_threshold)
+    req(filtered_data_for_plots_reactive())
+    num_sig <- filtered_data_for_plots_reactive() %>%
+      filter(P < sig_threshold_p_value) %>%
+      nrow()
+    paste0(pretty(num_sig, big.mark = ","))
+  })
+  
+  output$top_snps_table_header <- renderUI({
+    print("Executing output$top_snps_table_header...")
+    h5("Top 10 Most Significant SNPs (from current view):")
+  })
+  
+  output$top_snps_table <- renderTable({
+    print("Executing output$top_snps_table...")
+    req(filtered_data_for_plots_reactive())
+    
+    table_data <- filtered_data_for_plots_reactive() %>%
+      arrange(P) %>%
+      head(10)
+    
+    if (nrow(table_data) == 0) {
+      return(data.frame(Message = "No SNPs found in current view to display top 10."))
+    }
+    
+    table_cols <- c("SNP", "CHR", "BP", "P", "LOG10P", "A1", "A2", "FREQ_A1", "EFFECT_A1", "SE", "Original_CHR")
+    
+    existing_table_cols <- intersect(table_cols, names(table_data))
+    
+    table_data %>%
+      select(all_of(existing_table_cols)) %>%
+      mutate(P = formatC(P, format = "e", digits = 2),
+             across(any_of(c("FREQ_A1", "EFFECT_A1", "SE")), ~round(., 3)))
+  })
+  
+  output$study_info_header <- renderUI({
+    print("Executing output$study_info_header...")
+    req(r_gwas_info()) 
+    card_header(paste0("Study Information: ", r_gwas_info()$trait))
+  })
+  
+  output$study_info_content <- renderUI(
+    div(
+      print("Executing output$study_info_content..."),
+      req(r_gwas_info()), 
+      info_paragraph("Reported Trait", r_gwas_info()$study_info$reported_trait),
+      info_paragraph("Trait(s)", r_gwas_info()$study_info$trait_s),
+      info_paragraph("First Author", r_gwas_info()$study_info$first_author),
+      info_paragraph("Journal", r_gwas_info()$study_info$journal),
+      info_paragraph("Publication Date", r_gwas_info()$study_info$pub_date),
+      p(tags$b("PubMed ID: "), if(!is.null(r_gwas_info()$study_info$pubmed_id) && r_gwas_info()$study_info$pubmed_id != "") {
+        a(r_gwas_info()$study_info$pubmed_id, href = paste0("https://pubmed.ncbi.nlm.nih.gov/", r_gwas_info()$study_info$pubmed_id, "/"), target = "_blank")
+      } else "N/A"),
+      tags$ul(
+        tags$li(tags$b("Discovery Sample: "), r_gwas_info()$study_info$discovery_sample),
+        tags$li(tags$b("Replication Sample: "), if(!is.null(r_gwas_info()$study_info$replication_sample) && r_gwas_info()$study_info$replication_sample != "" && r_gwas_info()$study_info$replication_sample != "NA") r_gwas_info()$study_info$replication_sample else "N/A")
+      ),
+      info_paragraph("Genotyping Technology", r_gwas_info()$study_info$genotyping_tech),
+      info_paragraph("Platform", r_gwas_info()$study_info$platform)
+    )
+  )
+  
+}
+
+# --- 5. CREATE AND RUN THE SHINY APP ---
+shinyApp(ui, server)
