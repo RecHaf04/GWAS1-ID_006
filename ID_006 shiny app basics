@@ -13,7 +13,6 @@ library(data.table) # For fread()
 # Function to load and clean GWAS data (returns list with data, trait, sample_snp_id, axis_set, study_info)
 load_and_clean_gwas_data <- function(filepath, col_map = NULL, delimiter = NULL, trait_name_for_func, study_info_list_for_func) {
   # Add tryCatch block for robust error handling within data loading
-  # (Removed outer tryCatch for global load, this one remains for internal function errors)
   tryCatch({
     full_filepath <- file.path(getwd(), filepath)
     gwas_data_raw <- as_tibble(fread(full_filepath, header = TRUE, sep = delimiter, stringsAsFactors = FALSE, check.names = FALSE))
@@ -129,7 +128,7 @@ id006_metadata_for_global_load <- list(
     pub_date = "202X-XX-XX",
     pubmed_id = "DemoID",
     discovery_sample = "Demo Sample Description",
-    replication_sample = "N/A",
+    replication_sample = "N/A", # Ensure this is a string, not NULL or empty list
     genotyping_tech = "Demo Genotyping Technology",
     platform = "Demo Platform"
   ),
@@ -178,15 +177,74 @@ ui <- page_sidebar(
     p(textOutput("current_study_name")), # Display current study name
     hr(),
     h4("Filters"), # Consolidated filter section title
-    sliderInput(
+    textInput( # SNP search
+      inputId = "snp_search",
+      label = "Search by SNP ID:",
+      placeholder = "e.g., rs12345" # Placeholder updated dynamically in server
+    ),
+    textInput( # Allele 1 filter
+      inputId = "allele1_search",
+      label = "Filter by Allele 1 (Effect Allele):",
+      placeholder = "e.g., A, T, C, G"
+    ),
+    textInput( # Allele 2 filter
+      inputId = "allele2_search",
+      label = "Filter by Allele 2 (Other Allele):",
+      placeholder = "e.g., A, T, C, G"
+    ),
+    sliderInput( # Allele Frequency filter
+      inputId = "freq_a1_range",
+      label = "Allele 1 Frequency:",
+      min = 0, max = 1,
+      value = c(0, 1), # Full range by default
+      step = 0.01
+    ),
+    selectizeInput( # Chromosome filter (searchable dropdown)
+      inputId = "chr_filter",
+      label = "Filter by Chromosome:", # Corrected label
+      choices = NULL, # Choices updated dynamically in server
+      selected = NULL,
+      multiple = TRUE, 
+      options = list(placeholder = 'Select or type chromosome(s)')
+    ),
+    numericInput( # Min Position
+      inputId = "min_pos_filter",
+      label = "Min Position (BP):",
+      value = 0, min = 0, max = 250000000 # Default large range, updated dynamically
+    ),
+    numericInput( # Max Position
+      inputId = "max_pos_filter",
+      label = "Max Position (BP):",
+      value = 250000000, min = 0, max = 250000000 # Default large range, updated dynamically
+    ),
+    sliderInput( # Effect Size filter
+      inputId = "effect_size_range",
+      label = "Effect Size (Beta) Range:",
+      min = -1, max = 1, # Default wide range, updated dynamically
+      value = c(-1, 1),
+      step = 0.001
+    ),
+    sliderInput( # Standard Error filter
+      inputId = "se_range",
+      label = "Standard Error (SE) Range:",
+      min = 0, max = 0.1, # Default range, updated dynamically
+      value = c(0, 0.1),
+      step = 0.001
+    ),
+    sliderInput( # Significance Threshold
       inputId = "p_threshold",
       label = "Significance Threshold (-log10 P):",
       min = 0,
       max = max_log10p_global_for_slider + 1,
       value = 5, # Default to a value that might show some significant hits
       step = 0.1
+    ),
+    hr(),
+    actionButton(
+      inputId = "apply_filters_button",
+      label = "Apply Filters",
+      class = "btn-primary w-100"
     )
-    # All other filter controls are removed in this barebones version.
   ),
   navset_card_tab(
     nav_panel("Manhattan Plot",
@@ -223,15 +281,6 @@ ui <- page_sidebar(
 # --- 4. SERVER LOGIC DEFINITION ---
 server <- function(input, output, session) {
   
-  # Helper to create a paragraph with bold label, handles NA values
-  info_paragraph <- function(label, value) {
-    # Ensure value is character and non-empty before returning p tag
-    if (is.null(value) || is.na(value) || as.character(value) == "" || length(value) == 0) { # Added length(value) == 0 check
-      return(NULL) # Return NULL if value is problematic
-    }
-    p(tags$b(paste0(label, ": ")), as.character(value)) # Ensure value is character
-  }
-  
   # Reactive that provides the currently available data (globally loaded in this version)
   r_gwas_info <- reactive({
     req(!is.null(initial_gwas_data_info_global)) # Ensure global data is loaded
@@ -258,32 +307,170 @@ server <- function(input, output, session) {
     axis_set
   })
   
-  # Reactive expression to filter data based on p_threshold slider
-  filtered_data_for_plots_reactive <- reactive({
-    print("Executing filtered_data_for_plots_reactive...")
-    plot_data <- current_gwas_data_reactive()
-    threshold <- input$p_threshold # This depends on input$p_threshold
+  # ReactiveValues to store the filter inputs that trigger data processing
+  rv_filters <- reactiveValues(
+    snp_search = "", allele1_search = "", allele2_search = "", 
+    freq_a1_min = 0, freq_a1_max = 1,
+    chr_filter = character(0),
+    min_pos_filter = 0, max_pos_filter = 250000000,
+    effect_size_range = c(-1, 1), se_range = c(0, 0.1),
+    p_threshold = 5, 
+    filtered_and_processed_data = data.frame(), # This will store the final filtered data
+    snp_search_active = FALSE
+  )
+  
+  # Observer to trigger filtering and update rv_filters.
+  # Runs on 'apply_filters_button' click 
+  observeEvent(input$apply_filters_button, {
+    print("Executing observeEvent(input$apply_filters_button)... Applying filters.")
     
-    print(paste("Filtering for plots based on threshold:", threshold))
-    print(paste("Rows before filtering for plots:", nrow(plot_data)))
+    # Get current values of all filter inputs using isolate()
+    current_ui_snp_search <- isolate(input$snp_search)
+    current_ui_allele1_search <- isolate(input$allele1_search)
+    current_ui_allele2_search <- isolate(input$allele2_search)
+    current_ui_freq_a1_range <- isolate(input$freq_a1_range)
+    current_ui_chr_filter <- isolate(input$chr_filter)
+    current_ui_min_pos_filter <- isolate(input$min_pos_filter)
+    current_ui_max_pos_filter <- isolate(input$max_pos_filter)
+    current_ui_effect_size_range <- isolate(input$effect_size_range)
+    current_ui_se_range <- isolate(input$se_range)
+    current_ui_p_threshold <- isolate(input$p_threshold)
     
-    # Ensure LOG10P exists before trying to use it in mutate
-    if (!"LOG10P" %in% names(plot_data)) {
-      message("LOG10P column not found in plot_data for filtering. Skipping significance calculation.")
-      plot_data_filtered <- plot_data %>%
-        mutate(is_significant = FALSE) %>% # Default to not significant
-        mutate(alpha_value = 0.7) %>% # Default alpha
-        mutate(color_group = as.character(CHR %% 2))
-    } else {
-      plot_data_filtered <- plot_data %>%
-        mutate(is_significant = LOG10P >= threshold) %>%
-        mutate(alpha_value = ifelse(is_significant, 1, 0.7)) %>%
-        mutate(color_group = as.character(CHR %% 2))
+    # Get the base data to filter (from current_gwas_data_reactive)
+    base_data_to_filter <- current_gwas_data_reactive()
+    req(nrow(base_data_to_filter) > 0) 
+    
+    # --- Apply all filters ---
+    data_filtered <- base_data_to_filter
+    
+    # SNP search
+    if (!is.null(current_ui_snp_search) && current_ui_snp_search != "") {
+      data_filtered <- data_filtered %>% filter(grepl(current_ui_snp_search, SNP, ignore.case = TRUE))
+    }
+    # Allele filters
+    if (!is.null(current_ui_allele1_search) && current_ui_allele1_search != "") {
+      data_filtered <- data_filtered %>% filter(grepl(current_ui_allele1_search, A1, ignore.case = TRUE))
+    }
+    # Allele filters
+    if (!is.null(current_ui_allele2_search) && current_ui_allele2_search != "") {
+      data_filtered <- data_filtered %>% filter(grepl(current_ui_allele2_search, A2, ignore.case = TRUE))
+    }
+    # Frequency range filter
+    if (!is.null(current_ui_freq_a1_range) && length(current_ui_freq_a1_range) == 2) {
+      data_filtered <- data_filtered %>% filter(FREQ_A1 >= current_ui_freq_a1_range[1], FREQ_A1 <= current_ui_freq_a1_range[2])
+    }
+    # Chromosome filter
+    if (!is.null(current_ui_chr_filter) && length(current_ui_chr_filter) > 0) {
+      chr_to_filter_numeric <- as.numeric(current_ui_chr_filter)
+      data_filtered <- data_filtered %>% filter(CHR %in% chr_to_filter_numeric)
+    }
+    # Position range filter
+    if (!is.null(current_ui_min_pos_filter) && !is.na(current_ui_min_pos_filter) && !is.null(current_ui_max_pos_filter) && !is.na(current_ui_max_pos_filter)) {
+      data_filtered <- data_filtered %>% filter(BP >= current_ui_min_pos_filter, BP <= current_ui_max_pos_filter)
+    }
+    # Effect size range filter
+    if (!is.null(current_ui_effect_size_range) && length(current_ui_effect_size_range) == 2) {
+      data_filtered <- data_filtered %>% filter(EFFECT_A1 >= current_ui_effect_size_range[1], EFFECT_A1 <= current_ui_effect_size_range[2])
+    }
+    # Standard error range filter
+    if (!is.null(current_ui_se_range) && length(current_ui_se_range) == 2) {
+      data_filtered <- data_filtered %>% filter(SE >= current_ui_se_range[1], SE <= current_ui_se_range[2])
     }
     
+    print(paste("Rows after all filters in observer:", nrow(data_filtered)))
+    
+    # Update the reactiveValues object with the filtered data and filter states
+    rv_filters$filtered_and_processed_data <- data_filtered
+    rv_filters$p_threshold <- current_ui_p_threshold
+    rv_filters$snp_search_active <- (!is.null(current_ui_snp_search) && current_ui_snp_search != "")
+    
+  }) # End observeEvent
+  
+  
+  # This reactive now simply gets the data from rv_filters
+  filtered_data_for_plots_reactive <- reactive({
+    print("Executing filtered_data_for_plots_reactive...")
+    req(rv_filters$filtered_and_processed_data)
+    
+    plot_data <- rv_filters$filtered_and_processed_data 
+    threshold <- rv_filters$p_threshold 
+    
+    plot_data_filtered <- plot_data %>%
+      mutate(is_significant = LOG10P >= threshold) %>%
+      mutate(alpha_value = ifelse(is_significant, 1, 0.7)) %>%
+      mutate(color_group = as.character(CHR %% 2)) # Removed all hover text creation: hovertemplate_string, manhattan_text_for_display, manhattan_hoverinfo_mode
+    # This ensures no hover text generation logic interferes with Plotly
     print(paste("Rows after filtering for plots:", nrow(plot_data_filtered)))
     plot_data_filtered
   })
+  
+  
+  # Observer to update filter UI when current_gwas_data_reactive changes (after data loads into r_gwas_info)
+  observeEvent(current_gwas_data_reactive(), {
+    print("Executing observeEvent(current_gwas_data_reactive())... Updating filter UI ranges.")
+    current_data <- current_gwas_data_reactive()
+    req(nrow(current_data) > 0) # Ensure data is not empty
+    
+    # Update SNP search placeholder
+    sample_snp_id_for_ui <- current_data %>% arrange(P) %>% head(1) %>% pull(SNP)
+    updateTextInput(session, "snp_search", placeholder = paste0("e.g., ", sample_snp_id_for_ui))
+    
+    # Update Chromosome selectizeInput choices
+    chr_map_for_display <- current_data %>%
+      distinct(CHR, Original_CHR) %>%
+      arrange(CHR)
+    chr_choices_display <- setNames(as.character(chr_map_for_display$CHR), chr_map_for_display$Original_CHR)
+    updateSelectizeInput(session, "chr_filter",
+                         choices = chr_choices_display,
+                         selected = NULL, # Clear previous selection
+                         options = list(placeholder = 'Select or type chromosome(s)'))
+    
+    # Update Position Numeric Inputs (min/max values)
+    current_min_pos <- min(current_data$BP, na.rm = TRUE); if (!is.finite(current_min_pos)) current_min_pos <- 0
+    current_max_pos <- max(current_data$BP, na.rm = TRUE); if (!is.finite(current_max_pos)) current_max_pos <- 250000000
+    if (current_min_pos > current_max_pos) current_min_pos <- current_max_pos
+    updateNumericInput(session, "min_pos_filter", min = current_min_pos, max = current_max_pos, value = current_min_pos)
+    updateNumericInput(session, "max_pos_filter", min = current_max_pos, max = current_max_pos, value = current_max_pos) # Corrected max value
+    
+    # Update Allele 1 Freq Range Slider
+    updateSliderInput(session, "freq_a1_range",
+                      min = min(current_data$FREQ_A1, na.rm = TRUE), max = max(current_data$FREQ_A1, na.rm = TRUE),
+                      value = c(min(current_data$FREQ_A1, na.rm = TRUE), max(current_data$FREQ_A1, na.rm = TRUE)))
+    
+    # Update Effect Size Range Slider
+    current_min_effect <- min(current_data$EFFECT_A1, na.rm = TRUE); if (!is.finite(current_min_effect)) current_min_effect <- -1
+    current_max_effect <- max(current_data$EFFECT_A1, na.rm = TRUE); if (!is.finite(current_max_effect)) current_max_effect <- 1
+    if (current_min_effect > current_max_effect) current_min_effect <- current_max_effect
+    updateSliderInput(session, "effect_size_range",
+                      min = floor(current_min_effect * 100) / 100, max = ceiling(current_max_effect * 100) / 100,
+                      value = c(floor(current_min_effect * 100) / 100, ceiling(current_max_effect * 100) / 100))
+    
+    # Update Standard Error Range Slider
+    current_min_se <- 0; current_max_se <- max(current_data$SE, na.rm = TRUE); if (!is.finite(current_max_se) || current_max_se == 0) current_max_se <- 0.1
+    updateSliderInput(session, "se_range",
+                      min = current_min_se, max = ceiling(current_max_se * 100) / 100,
+                      value = c(current_min_se, ceiling(current_max_se * 100) / 100))
+    
+    # Update P-threshold slider max and value
+    max_log10p_data <- max(current_data$LOG10P, na.rm = TRUE); if (!is.finite(max_log10p_data)) max_log10p_data <- 10
+    updateSliderInput(session, "p_threshold", max = max_log10p_data + 1, value = min(5, max_log10p_data + 0.5))
+    
+    # Initialize rv_filters here with values from current_data and default UI inputs
+    rv_filters$snp_search <- isolate(input$snp_search)
+    rv_filters$allele1_search <- isolate(input$allele1_search)
+    rv_filters$allele2_search <- isolate(input$allele2_search)
+    rv_filters$freq_a1_min <- isolate(input$freq_a1_range[1])
+    rv_filters$freq_a1_max <- isolate(input$freq_a1_range[2])
+    rv_filters$chr_filter <- isolate(input$chr_filter)
+    rv_filters$min_pos_filter <- isolate(input$min_pos_filter)
+    rv_filters$max_pos_filter <- isolate(input$max_pos_filter)
+    rv_filters$effect_size_range <- isolate(input$effect_size_range)
+    rv_filters$se_range <- isolate(input$se_range)
+    rv_filters$p_threshold <- isolate(input$p_threshold)
+    rv_filters$filtered_and_processed_data <- current_data # Initial filtered data is just the full data
+    rv_filters$snp_search_active <- FALSE # No search active initially
+  })
+  
   
   # --- Dynamic UI Outputs for Headers ---
   output$current_study_name <- renderText({
@@ -321,18 +508,7 @@ server <- function(input, output, session) {
     print("Axis set details (CHR, Center):")
     print(axis_set)
     
-    p <- ggplot(plot_data, aes(x = BP_cum, y = LOG10P,
-                               text = paste0("SNP: ", SNP,
-                                             "<br>Chr: ", Original_CHR,
-                                             "<br>Pos: ", BP,
-                                             "<br>P-value: ", formatC(P, format = "e", digits = 2),
-                                             "<br>-log10(P): ", round(LOG10P, 2),
-                                             "<br>Allele 1: ", A1,
-                                             "<br>Allele 2: ", A2,
-                                             "<br>Frequency: ", round(FREQ_A1, 3),
-                                             "<br>Effect: ", round(EFFECT_A1, 3),
-                                             "<br>StdErr: ", round(SE, 3)
-                               ))) +
+    p <- ggplot(plot_data, aes(x = BP_cum, y = LOG10P)) + # No text aesthetic for hover
       geom_point(aes(color = as.factor(color_group), alpha = alpha_value), size = 1.5) +
       geom_hline(yintercept = input$p_threshold, color = "red", linetype = "dashed", linewidth = 0.8) +
       annotate("text", x = max(plot_data$BP_cum, na.rm = TRUE) * 0.95,
@@ -351,17 +527,16 @@ server <- function(input, output, session) {
         axis.text.x = element_text(angle = 45, hjust = 1)
       )
     
-    ggplotly(p, tooltip = "text") %>%
+    ggplotly(p, tooltip = "none") %>% # Explicitly set tooltip to "none"
       layout(hovermode = "closest")
   })
   
-  # Render QQ Plot
   output$qq_plot <- renderPlotly({
     print("Executing output$qq_plot...")
     plot_data_qq <- filtered_data_for_plots_reactive()
     
     if (nrow(plot_data_qq) == 0 || all(is.na(plot_data_qq$P)) || all(plot_data_qq$P == 0, na.rm = TRUE)) {
-      return(ggplotly(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "P-value data missing or invalid.") + theme_void()))
+      return(ggplotly(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "P-value data missing or invalid.") + theme_void(), tooltip = "none")) # tooltip = "none"
     }
     
     print(paste("Rendering QQ plot. Rows:", nrow(plot_data_qq)))
@@ -381,10 +556,9 @@ server <- function(input, output, session) {
       theme_minimal() +
       theme(plot.title = element_text(hjust = 0.5))
     
-    ggplotly(p_qq)
+    ggplotly(p_qq, tooltip = "none") # tooltip = "none"
   })
   
-  # Render Summary Data
   output$total_snps <- renderText({
     print("Executing output$total_snps...")
     req(filtered_data_for_plots_reactive())
@@ -440,27 +614,99 @@ server <- function(input, output, session) {
   })
   
   output$study_info_content <- renderUI(
-    div(
-      print("Executing output$study_info_content..."),
-      req(r_gwas_info()), 
-      info_paragraph("Reported Trait", r_gwas_info()$study_info$reported_trait),
-      info_paragraph("Trait(s)", r_gwas_info()$study_info$trait_s),
-      info_paragraph("First Author", r_gwas_info()$study_info$first_author),
-      info_paragraph("Journal", r_gwas_info()$study_info$journal),
-      info_paragraph("Publication Date", r_gwas_info()$study_info$pub_date),
-      p(tags$b("PubMed ID: "), if(!is.null(r_gwas_info()$study_info$pubmed_id) && r_gwas_info()$study_info$pubmed_id != "") {
-        a(r_gwas_info()$study_info$pubmed_id, href = paste0("https://pubmed.ncbi.nlm.nih.gov/", r_gwas_info()$study_info$pubmed_id, "/"), target = "_blank")
-      } else "N/A"),
-      tags$ul(
-        tags$li(tags$b("Discovery Sample: "), r_gwas_info()$study_info$discovery_sample),
-        tags$li(tags$b("Replication Sample: "), if(!is.null(r_gwas_info()$study_info$replication_sample) && r_gwas_info()$study_info$replication_sample != "" && r_gwas_info()$study_info$replication_sample != "NA") r_gwas_info()$study_info$replication_sample else "N/A")
-      ),
-      info_paragraph("Genotyping Technology", r_gwas_info()$study_info$genotyping_tech),
-      info_paragraph("Platform", r_gwas_info()$study_info$platform)
-    )
+    # Use a local variable for study_info to ensure consistent access and less verbose code
+    {
+      study_info_local <- r_gwas_info()$study_info
+      req(!is.null(study_info_local)) # Ensure study_info_local is not NULL before proceeding
+      
+      # Initialize list to hold HTML elements
+      elements_to_render <- list()
+      
+      # Helper to get a safe character string or NULL
+      get_safe_char <- function(value) {
+        val_char <- as.character(value)
+        if (is.null(value) || is.na(value) || !nzchar(val_char) || length(val_char) != 1) {
+          return(NULL) # Return NULL to explicitly skip this element if invalid
+        }
+        return(val_char)
+      }
+      
+      # Reported Trait
+      reported_trait_val <- get_safe_char(study_info_local$reported_trait)
+      if (!is.null(reported_trait_val)) {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("Reported Trait: "), reported_trait_val)))
+      }
+      # Trait(s)
+      trait_s_val <- get_safe_char(study_info_local$trait_s)
+      if (!is.null(trait_s_val)) {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("Trait(s): "), trait_s_val)))
+      }
+      # First Author
+      first_author_val <- get_safe_char(study_info_local$first_author)
+      if (!is.null(first_author_val)) {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("First Author: "), first_author_val)))
+      }
+      # Journal
+      journal_val <- get_safe_char(study_info_local$journal)
+      if (!is.null(journal_val)) {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("Journal: "), journal_val)))
+      }
+      # Publication Date
+      pub_date_val <- get_safe_char(study_info_local$pub_date)
+      if (!is.null(pub_date_val)) {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("Publication Date: "), pub_date_val)))
+      }
+      
+      # PubMed ID (with link) - Special handling for HTML link
+      pubmed_id_val <- get_safe_char(study_info_local$pubmed_id)
+      if (!is.null(pubmed_id_val)) {
+        elements_to_render <- c(elements_to_render, list(
+          tags$p(tags$b("PubMed ID: "), tags$a(href = paste0("https://pubmed.ncbi.nlm.nih.gov/", pubmed_id_val, "/"), target = "_blank", pubmed_id_val))
+        ))
+      } else {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("PubMed ID: "), "N/A")))
+      }
+      
+      # Nested <ul> for Samples
+      sample_elements <- list()
+      # Discovery Sample
+      discovery_sample_val <- get_safe_char(study_info_local$discovery_sample)
+      if (!is.null(discovery_sample_val)) {
+        sample_elements <- c(sample_elements, list(tags$li(tags$b("Discovery Sample: "), discovery_sample_val)))
+      } else {
+        sample_elements <- c(sample_elements, list(tags$li(tags$b("Discovery Sample: "), "N/A")))
+      }
+      # Replication Sample
+      replication_sample_val <- get_safe_char(study_info_local$replication_sample)
+      if (!is.null(replication_sample_val) && replication_sample_val != "NA") { # Check for "NA" string from prev. default
+        sample_elements <- c(sample_elements, list(tags$li(tags$b("Replication Sample: "), replication_sample_val)))
+      } else {
+        sample_elements <- c(sample_elements, list(tags$li(tags$b("Replication Sample: "), "N/A")))
+      }
+      
+      # Add <ul> only if there are sample elements
+      if (length(sample_elements) > 0) {
+        elements_to_render <<- c(elements_to_render, list(tags$ul(sample_elements)))
+      }
+      
+      # Genotyping Technology
+      genotyping_tech_val <- get_safe_char(study_info_local$genotyping_tech)
+      if (!is.null(genotyping_tech_val)) {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("Genotyping Technology: "), genotyping_tech_val)))
+      }
+      # Platform
+      platform_val <- get_safe_char(study_info_local$platform)
+      if (!is.null(platform_val)) {
+        elements_to_render <- c(elements_to_render, list(tags$p(tags$b("Platform: "), platform_val)))
+      }
+      
+      # Return all collected elements within a div
+      do.call(div, elements_to_render)
+    }
   )
   
 }
 
 # --- 5. CREATE AND RUN THE SHINY APP ---
 shinyApp(ui, server)
+
